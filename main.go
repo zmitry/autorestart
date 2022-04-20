@@ -77,7 +77,7 @@ func main() {
 	for range ticker.C {
 		changed, err := isChangedByStat(bin[0])
 		if err != nil && changed {
-			fmt.Println("[autorestart] restarting...")
+			fmt.Println("[autorestart v2] restarting...")
 			cancel()
 			ctx, cancel = context.WithCancel(context.Background())
 			if err := g.Wait(); err != nil {
