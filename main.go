@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"time"
@@ -15,32 +14,30 @@ var (
 	startFileInfo os.FileInfo
 )
 
-func isChangedByStat(filename string) bool {
+func isChangedByStat(filename string) (bool, error) {
 	fileinfo, err := os.Stat(filename)
 	if err == nil {
 		// first update
 		if startFileInfo == nil {
 			startFileInfo = fileinfo
-			return false
+			return false, nil
 		}
 
 		if startFileInfo.ModTime() != fileinfo.ModTime() ||
 			startFileInfo.Size() != fileinfo.Size() {
 			startFileInfo = fileinfo
-			return true
+			return true, nil
 		}
 
-		return false
+		return false, nil
 	}
 
-	log.Printf("[autorestart] cannot find %s: %s", filename, err)
-	return false
+	return false, fmt.Errorf("cannot find %s: %s", filename, err)
 }
 
 func RestartByExec(ctx context.Context, bin string, args []string) error {
 	binary, err := exec.LookPath(bin)
 	if err != nil {
-		log.Printf("[autorestart] Error: %s", err)
 		return err
 	}
 	time.Sleep(1 * time.Second)
@@ -50,7 +47,6 @@ func RestartByExec(ctx context.Context, bin string, args []string) error {
 	cmd.Env = os.Environ()
 	startErr := cmd.Start()
 	if startErr != nil {
-		log.Printf("[autorestart] error: %s %v", binary, startErr)
 		return err
 	}
 
@@ -61,7 +57,6 @@ func RestartByExec(ctx context.Context, bin string, args []string) error {
 				return err
 			}
 		} else {
-			fmt.Println("[autorestart] ", err)
 			return err
 		}
 	}
@@ -70,27 +65,42 @@ func RestartByExec(ctx context.Context, bin string, args []string) error {
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
-
+	maxErrors := 10
 	g, gctx := errgroup.WithContext(ctx)
-
-	ticker := time.NewTicker(time.Second * 1)
+	currentTick := time.Second * 1
+	ticker := time.NewTicker(currentTick)
 	bin := os.Args[1:]
 	g.Go(func() error {
 		return RestartByExec(gctx, bin[0], bin[1:])
 	})
-
+	errCount := 0
 	for range ticker.C {
-		if isChangedByStat(bin[0]) {
+		changed, err := isChangedByStat(bin[0])
+		if err != nil && changed {
 			fmt.Println("[autorestart] restarting...")
 			cancel()
 			ctx, cancel = context.WithCancel(context.Background())
 			if err := g.Wait(); err != nil {
+				errCount += 1
 				fmt.Println("[autorestart] error: ", err)
+				if errCount == 5 {
+					fmt.Println("[autorestart] too many errors, exiting")
+					os.Exit(1)
+				}
+			} else {
+				errCount = 0
 			}
 			g, gctx := errgroup.WithContext(ctx)
 			g.Go(func() error {
 				return RestartByExec(gctx, bin[0], bin[1:])
 			})
+		} else if err != nil {
+			fmt.Println("[autorestart] error: ", err)
+			errCount += 1
+			if errCount == maxErrors {
+				fmt.Println("[autorestart] too many errors, exiting")
+				os.Exit(1)
+			}
 		}
 	}
 }
