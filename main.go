@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 var (
@@ -35,11 +37,11 @@ func isChangedByStat(filename string) bool {
 	return false
 }
 
-func RestartByExec(ctx context.Context, bin string, args []string) {
+func RestartByExec(ctx context.Context, bin string, args []string) error {
 	binary, err := exec.LookPath(bin)
 	if err != nil {
 		log.Printf("[autorestart] Error: %s", err)
-		return
+		return err
 	}
 	time.Sleep(1 * time.Second)
 	cmd := exec.CommandContext(ctx, binary, args...)
@@ -49,34 +51,46 @@ func RestartByExec(ctx context.Context, bin string, args []string) {
 	startErr := cmd.Start()
 	if startErr != nil {
 		log.Printf("[autorestart] error: %s %v", binary, startErr)
+		return err
 	}
 
-	go func() {
-		if err := cmd.Wait(); err != nil {
-			if e, ok := err.(*exec.ExitError); ok {
-				if e.Exited() {
-					fmt.Printf("[autorestart] process exited by itself %s", e.Error())
-				}
-			} else {
-				fmt.Println(err)
+	if err := cmd.Wait(); err != nil {
+		if e, ok := err.(*exec.ExitError); ok {
+			if e.Exited() {
+				fmt.Printf("[autorestart] process exited by itself %s", e.Error())
+				return err
 			}
+		} else {
+			fmt.Println("[autorestart] ", err)
+			return err
 		}
-	}()
+	}
+	return nil
 }
 
 func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	g, gctx := errgroup.WithContext(ctx)
+
 	ticker := time.NewTicker(time.Second * 1)
 	bin := os.Args[1:]
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		RestartByExec(ctx, bin[0], bin[1:])
-	}()
+	g.Go(func() error {
+		return RestartByExec(gctx, bin[0], bin[1:])
+	})
+
 	for range ticker.C {
 		if isChangedByStat(bin[0]) {
 			fmt.Println("[autorestart] restarting...")
 			cancel()
 			ctx, cancel = context.WithCancel(context.Background())
-			RestartByExec(ctx, bin[0], bin[1:])
+			if err := g.Wait(); err != nil {
+				fmt.Println("[autorestart] error: ", err)
+			}
+			g, gctx := errgroup.WithContext(ctx)
+			g.Go(func() error {
+				return RestartByExec(gctx, bin[0], bin[1:])
+			})
 		}
 	}
 }
