@@ -22,7 +22,7 @@ func main() {
 		for {
 			select {
 			case <-ctx.Done():
-				fmt.Println("Break the loop")
+				fmt.Println("Break th loop")
 				return
 			case <-time.After(1 * time.Second):
 				fmt.Println("Hello in a loop")
