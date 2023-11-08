@@ -6,36 +6,32 @@ import (
 	"os"
 	"os/exec"
 	"time"
+	"log/slog"
 
-	"golang.org/x/sync/errgroup"
+	"github.com/cenkalti/backoff/v4"
 )
 
-var (
-	startFileInfo os.FileInfo
-)
 
-func isChangedByStat(filename string) (bool, error) {
-	fileinfo, err := os.Stat(filename)
-	if err == nil {
-		// first update
-		if startFileInfo == nil {
-			startFileInfo = fileinfo
-			return false, nil
-		}
+func hasFileChanged(filename string, startFileInfo *os.FileInfo) (bool, error) {
+	fileInfo, err := os.Stat(filename)
+	if err != nil {
+		return false, fmt.Errorf("error stating file: %w", err)
+	}
 
-		if startFileInfo.ModTime() != fileinfo.ModTime() ||
-			startFileInfo.Size() != fileinfo.Size() {
-			startFileInfo = fileinfo
-			return true, nil
-		}
-
+	if *startFileInfo == nil {
+		*startFileInfo = fileInfo
 		return false, nil
 	}
 
-	return false, fmt.Errorf("cannot find %s: %s", filename, err)
+	if (*startFileInfo).ModTime() != fileInfo.ModTime() || (*startFileInfo).Size() != fileInfo.Size() {
+		*startFileInfo = fileInfo
+		return true, nil
+	}
+
+	return false, nil
 }
 
-func RestartByExec(ctx context.Context, bin string, args []string) error {
+func StartProcess(ctx context.Context, bin string, args []string) error {
 	binary, err := exec.LookPath(bin)
 	if err != nil {
 		return err
@@ -53,54 +49,64 @@ func RestartByExec(ctx context.Context, bin string, args []string) error {
 	if err := cmd.Wait(); err != nil {
 		if e, ok := err.(*exec.ExitError); ok {
 			if e.Exited() {
-				fmt.Printf("[autorestart] process exited by itself %s", e.Error())
+				slog.Error("[autorestart] process exited by itself %s", e.Error())
 				return err
 			}
 		} else {
 			return err
 		}
 	}
+
 	return nil
+}
+
+func runBackoff(ctx context.Context,  fn func() error) error {
+	backoffConfig := backoff.NewExponentialBackOff()
+	backoffConfig.MaxInterval = 10 * time.Second
+	backoffConfig.MaxElapsedTime = 1 * time.Minute
+	b := backoff.WithContext(backoffConfig, ctx)
+	return backoff.Retry(fn, b)
 }
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
-	maxErrors := 10
-	g, gctx := errgroup.WithContext(ctx)
+	// make channel which will trigger restart 
+	restartChan := make(chan bool)
+	// maxErrors := 10
 	currentTick := time.Second * 1
 	ticker := time.NewTicker(currentTick)
 	bin := os.Args[1:]
-	g.Go(func() error {
-		return RestartByExec(gctx, bin[0], bin[1:])
-	})
-	errCount := 0
-	for range ticker.C {
-		changed, err := isChangedByStat(bin[0])
-		if changed {
-			fmt.Println("[autorestart v2] restarting...")
+	
+	go func() {
+		// read from channel and restart
+		for range restartChan {
+			slog.Info("starting process", "component", "autorestart")
 			cancel()
 			ctx, cancel = context.WithCancel(context.Background())
-			if err := g.Wait(); err != nil {
-				errCount += 1
-				fmt.Println("[autorestart] error: ", err)
-				if errCount == 5 {
-					fmt.Println("[autorestart] too many errors, exiting")
+			go func ()  {
+				startError := runBackoff(ctx, func() error {
+					return StartProcess(ctx, bin[0], bin[1:])
+				})
+				if startError != nil {
+					slog.Error("start error", "error", startError)
 					os.Exit(1)
 				}
-			} else {
-				errCount = 0
-			}
-			g, gctx := errgroup.WithContext(ctx)
-			g.Go(func() error {
-				return RestartByExec(gctx, bin[0], bin[1:])
-			})
-		} else if err != nil {
-			fmt.Println("[autorestart] error: ", err)
-			errCount += 1
-			if errCount == maxErrors {
-				fmt.Println("[autorestart] too many errors, exiting")
-				os.Exit(1)
-			}
+			}()
+		
+		}
+		slog.Info("exiting", "component", "autorestart")
+	}()
+	restartChan <- true
+
+	var startFileInfo os.FileInfo
+	for range ticker.C {
+		changed, err := hasFileChanged(bin[0], &startFileInfo)
+		if changed {
+		slog.Info("checking for changes", "component", "autorestart", "changed", changed)
+			restartChan <- true
+		}  
+		if err != nil {
+			slog.Error(fmt.Sprintf("failed stat file: %s", err), "component", "autorestart")
 		}
 	}
 }
